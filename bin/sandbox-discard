@@ -1,0 +1,76 @@
+#!/usr/bin/env node
+// portable-sandbox: throw away the agent's workspace, start fresh next launch.
+// Usage:
+//   sandbox-discard [--config path/to/sandbox-config.yaml] [--yes]
+//
+// Without --yes, prints what would be removed and exits. With --yes, actually
+// removes the per-target workspace directory. Dep volumes (.venv etc) are NOT
+// touched — use `docker volume rm` if you also want to wipe installed packages.
+
+import { existsSync, rmSync, statSync } from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { loadConfig } from "../lib/config.mjs";
+import { workspacePathFor } from "../lib/prepare-workspace.mjs";
+import { parseCliArgs } from "../lib/parse-cli-args.mjs";
+import { createLog } from "../lib/log.mjs";
+import { silent, capture } from "../lib/run.mjs";
+
+const log = createLog("sandbox-discard");
+
+const args = parseCliArgs(process.argv.slice(2), {
+  flags: {
+    configPath: { long: "--config", takesValue: true },
+    yes:        { long: "--yes",    short: "-y" },
+  },
+  printHelp: () => console.log("Usage: sandbox-discard [--config <path>] [--yes]"),
+});
+
+const configPath = args.configPath || path.resolve(process.cwd(), "sandbox-config.yaml");
+if (!existsSync(configPath)) {
+  log.err(`config not found: ${configPath}`);
+  process.exit(2);
+}
+
+const config = loadConfig(configPath);
+const workspaceDir = workspacePathFor(config.target);
+
+if (!existsSync(workspaceDir)) {
+  log.out(`no workspace to discard for ${config.target}`);
+  process.exit(0);
+}
+
+log.out(`workspace: ${workspaceDir}`);
+try {
+  const st = statSync(workspaceDir);
+  log.out(`created:   ${st.birthtime.toISOString()}`);
+} catch { /* fine */ }
+
+if (!args.yes) {
+  log.out("dry-run — pass --yes to actually delete.");
+  log.out("tip: run sandbox-diff first to see what you'd be throwing away.");
+  process.exit(0);
+}
+
+// Stop any containers that have the workspace bind-mounted. Without this,
+// rmSync fails with ENOTEMPTY on macOS because the broker / services / agent
+// containers are still holding mount references into the workspace tree.
+// Idempotent: docker rm -f of an absent container is a no-op.
+log.out("stopping containers that mount the workspace");
+silent("docker", ["stop", "-t", "5", "portable-sandbox-services"]);
+silent("docker", ["rm", "-f", "portable-sandbox-services"]);
+silent("docker", ["rm", "-f", "portable-sandbox-broker"]);
+const ps = capture("docker", ["ps", "--format", "{{.Names}}"]);
+for (const name of (ps.stdout || "").split("\n")) {
+  if (name.startsWith("portable-sandbox-agent-")) {
+    silent("docker", ["rm", "-f", name]);
+  }
+}
+
+// Restore write perms across the tree before deleting. The workspace contains
+// readonly dirs (chmod 0555) from `readonly:` enforcement; rmSync can't unlink
+// children of a 0555 dir, so we relax perms first. `chmod -R u+w` is the most
+// reliable way to do this on macOS/Linux for arbitrary trees.
+silent("chmod", ["-R", "u+w", workspaceDir]);
+rmSync(workspaceDir, { recursive: true, force: true });
+log.out(`removed. next sandbox-up will copy fresh from target.`);

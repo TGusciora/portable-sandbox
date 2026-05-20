@@ -1,0 +1,192 @@
+#!/usr/bin/env node
+// portable-sandbox: copy the agent's workspace changes back into the target repo.
+// Usage:
+//   sandbox-apply [--config path/to/sandbox-config.yaml] [--dry-run] [--no-delete] [--force-delete] [--checksum]
+//
+// Uses rsync to mirror workspace → target, excluding hidden/readonly/dep_volume
+// paths, .git, .sandbox-broker-state, and common build caches. Files the agent
+// deleted in the workspace ARE removed from the target by default — three
+// safety layers gate this:
+//   1. --exclude on hidden/readonly/dep_volume patterns (rsync skips both
+//      directions, so sensitive files are never delete-candidates).
+//   2. --filter='P ...' (protect) on the same patterns — belt and suspenders
+//      against config drift.
+//   3. Tripwire: a preflight dry-run counts how many files would be deleted;
+//      aborts if the count exceeds DELETE_TRIPWIRE_LIMIT. Override with
+//      --force-delete.
+//
+// You can then `cd` into the target repo and commit normally.
+
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { loadConfig } from "../lib/config.mjs";
+import { workspacePathFor } from "../lib/prepare-workspace.mjs";
+import { excludeNames } from "../lib/exclude-names.mjs";
+import { parseCliArgs } from "../lib/parse-cli-args.mjs";
+import { createLog } from "../lib/log.mjs";
+
+const DELETE_TRIPWIRE_LIMIT = 50;
+const log = createLog("sandbox-apply");
+
+function printHelp() {
+  console.log(`Usage: sandbox-apply [--config <path>] [--dry-run] [--no-delete] [--force-delete]
+  --dry-run        show what would change but don't write anything
+  --no-delete      additive only — don't remove files from target even if the
+                   agent deleted them in the workspace (default: delete with
+                   tripwire safety, see --force-delete)
+  --force-delete   bypass the >${DELETE_TRIPWIRE_LIMIT}-file deletion tripwire (use after reviewing
+                   --dry-run; intended for legitimate large refactors)
+
+Comparison is by content checksum (mtime-only diffs are never reported).`);
+}
+
+// Protect rules ensure dest files matching these patterns are never deleted,
+// even under --delete. Belt-and-suspenders on top of the excludes — protects
+// us if someone removes a line from `hidden:` without thinking.
+function protectPatterns(config) {
+  return [...config.hidden, ...config.readonly, ...config.dep_volumes];
+}
+
+function buildRsyncArgs({ dryRun, withDelete, excludes, protects, src, dst }) {
+  // -rl    : recurse + follow symlinks. No -t — we intentionally do NOT sync
+  //          mtimes. Combined with --checksum below, rsync decides transfers
+  //          by content hash, so timestamp-only "diffs" never show up in
+  //          itemize output. mtime sync in a workspace→target flow is
+  //          cosmetic (git ignores it; touched-file mtimes still bump on
+  //          actual writes, so downstream build tools still see them as new).
+  // --checksum : compare by content hash. Authoritative; ignores mtime/size
+  //          shortcuts. Modest perf hit (reads file bytes) — fine for a
+  //          manual apply step.
+  const a = ["-rl", "-i", "-h", "--no-perms", "--no-owner", "--no-group", "--checksum"];
+  if (dryRun) a.push("--dry-run");
+  if (withDelete) a.push("--delete-after");
+  for (const name of excludes) a.push("--exclude", name);
+  for (const p of protects) a.push("--filter", `P ${p}`);
+  a.push(`${src}/`, `${dst}/`);
+  return a;
+}
+
+// Count "*deleting <path>" lines from rsync -i output.
+function countDeletions(stdout) {
+  if (!stdout) return 0;
+  let n = 0;
+  for (const line of stdout.split("\n")) {
+    if (line.startsWith("*deleting")) n++;
+  }
+  return n;
+}
+
+// Filter rsync -i output to keep only lines representing real changes.
+// Itemize column 1 = '.' means "no transfer happens" — those lines exist only
+// because rsync reports mtime/perm differences in subsequent columns, even
+// when it's not going to touch the file (confirmed by direct test). Drop them.
+// Keep lines where col 1 is '>' or '<' (transfer), 'c' (creation), 'h' (hard
+// link), or starts with '*' (deletion / message).
+function filterRsyncOutput(text) {
+  if (!text) return "";
+  const out = [];
+  for (const line of text.split("\n")) {
+    if (line.length === 0) continue;
+    const c0 = line[0];
+    if (c0 === "." || c0 === " ") continue;
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
+const args = parseCliArgs(process.argv.slice(2), {
+  flags: {
+    configPath:  { long: "--config",       takesValue: true },
+    dryRun:      { long: "--dry-run",      short: "-n" },
+    noDelete:    { long: "--no-delete" },
+    forceDelete: { long: "--force-delete" },
+  },
+  printHelp,
+});
+const configPath = args.configPath || path.resolve(process.cwd(), "sandbox-config.yaml");
+if (!existsSync(configPath)) {
+  log.err(`config not found: ${configPath}`);
+  process.exit(2);
+}
+
+const config = loadConfig(configPath);
+const workspaceDir = workspacePathFor(config.target);
+
+if (!existsSync(workspaceDir)) {
+  log.err(`no workspace yet for ${config.target}`);
+  console.error(`               run sandbox-up first.`);
+  process.exit(2);
+}
+
+const excludes = excludeNames(config);
+const protects = protectPatterns(config);
+const withDelete = !args.noDelete;
+
+log.err(`workspace: ${workspaceDir}`);
+log.err(`target:    ${config.target}`);
+log.err(`excludes:  ${excludes.join(", ")}`);
+log.err(`protects:  ${protects.join(", ") || "(none)"}`);
+log.err(`mode:      ${args.dryRun ? "dry-run" : "apply"}${withDelete ? (args.forceDelete ? " (delete, tripwire bypassed)" : " (delete, tripwire armed)") : " (additive)"}`);
+console.error("");
+
+// ---- Tripwire ----
+// Why this exists: the obvious failure mode here isn't a malicious agent —
+// it's a config typo. Drop a single line from `hidden:` (e.g. remove
+// `secrets/**`), re-run apply, and rsync happily mirrors the workspace's
+// "secrets is empty" view onto the target, deleting the whole directory.
+// By counting up the proposed deletions before committing to anything, we
+// catch wide blasts before they happen. The limit is generous enough for
+// real refactors (--force-delete waves it after dry-run review).
+//
+// Only runs when we'd actually delete: not --no-delete, not --dry-run, not
+// already bypassed. Captures rsync's itemize output, counts "*deleting"
+// lines, aborts if the count exceeds DELETE_TRIPWIRE_LIMIT.
+if (withDelete && !args.dryRun && !args.forceDelete) {
+  const preflightArgs = buildRsyncArgs({
+    dryRun: true, withDelete: true,
+    excludes, protects, src: workspaceDir, dst: config.target,
+  });
+  const p = spawnSync("rsync", preflightArgs, { encoding: "utf8" });
+  if (p.status !== 0) {
+    log.err(`preflight rsync failed (exit ${p.status})`);
+    if (p.stderr) console.error(p.stderr);
+    process.exit(p.status || 1);
+  }
+  const deletions = countDeletions(p.stdout);
+  if (deletions > DELETE_TRIPWIRE_LIMIT) {
+    log.err(`tripwire: ${deletions} files would be deleted (limit: ${DELETE_TRIPWIRE_LIMIT}).`);
+    log.err(`aborting. preview with:  sandbox-apply --dry-run`);
+    log.err(`if intentional, re-run:  sandbox-apply --force-delete`);
+    process.exit(3);
+  }
+  if (deletions > 0) {
+    log.err(`tripwire OK: ${deletions} file(s) will be deleted (under limit ${DELETE_TRIPWIRE_LIMIT}).`);
+    console.error("");
+  }
+}
+
+const rsyncArgs = buildRsyncArgs({
+  dryRun: args.dryRun, withDelete,
+  excludes, protects, src: workspaceDir, dst: config.target,
+});
+
+const r = spawnSync("rsync", rsyncArgs, { encoding: "utf8" });
+if (r.status !== 0) {
+  log.err(`rsync failed (exit ${r.status})`);
+  if (r.stderr) process.stderr.write(r.stderr);
+  process.exit(r.status || 1);
+}
+const filtered = filterRsyncOutput(r.stdout);
+if (filtered) process.stdout.write(filtered + "\n");
+else log.err(`no changes detected.`);
+if (r.stderr) process.stderr.write(r.stderr);
+
+if (args.dryRun) {
+  console.error("");
+  log.err("dry-run complete. re-run without --dry-run to apply.");
+} else {
+  console.error("");
+  log.err(`applied. review with: cd ${config.target} && git status`);
+}

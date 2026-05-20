@@ -1,0 +1,62 @@
+#!/usr/bin/env node
+// Tear down broker + networks. Per-target workspace directories at
+// $TMPDIR/portable-sandbox-workspace-<slug> are left behind so the agent's
+// changes can be reviewed (sandbox-diff), copied back to the real repo
+// (sandbox-apply), or thrown away (sandbox-discard).
+
+import { createLog } from "../lib/log.mjs";
+import { silent, capture } from "../lib/run.mjs";
+
+const log = createLog("sandbox-down");
+
+const BROKER_NAME   = "portable-sandbox-broker";
+const SERVICES_NAME = "portable-sandbox-services";
+const BROKER_NET    = "portable-sandbox-broker-net";
+const AGENT_NET     = "portable-sandbox-agent-net";
+
+log.out("stopping services container");
+// SIGTERM first so the control server's shutdown handler kills children
+// gracefully, then force-remove a beat later in case anything hangs.
+silent("docker", ["stop", "-t", "5", SERVICES_NAME]);
+silent("docker", ["rm", "-f", SERVICES_NAME]);
+
+log.out("stopping broker container");
+silent("docker", ["rm", "-f", BROKER_NAME]);
+
+log.out("stopping any leftover agent containers");
+const r = capture("docker", ["ps", "--format", "{{.Names}}"]);
+for (const name of (r.stdout || "").split("\n")) {
+  if (name.startsWith("portable-sandbox-agent-")) silent("docker", ["rm", "-f", name]);
+}
+
+// Disconnect anything still attached (e.g. compose service containers we
+// bridged in via sandbox-up) so `network rm` succeeds and so we don't leave
+// those containers carrying a dangling sandbox endpoint. The compose
+// containers themselves keep running on their own compose network.
+function disconnectAll(netName) {
+  const r = capture(
+    "docker",
+    ["network", "inspect", netName, "--format", "{{range .Containers}}{{.Name}} {{end}}"],
+  );
+  if (r.status !== 0) return;
+  for (const name of (r.stdout || "").trim().split(/\s+/).filter(Boolean)) {
+    silent("docker", ["network", "disconnect", "-f", netName, name]);
+  }
+}
+
+log.out("removing networks");
+disconnectAll(BROKER_NET);
+disconnectAll(AGENT_NET);
+silent("docker", ["network", "rm", BROKER_NET]);
+silent("docker", ["network", "rm", AGENT_NET]);
+
+log.out("done.");
+log.out("preserved:");
+console.log("  - workspace dir (per target) at $TMPDIR/portable-sandbox-workspace-<slug>");
+console.log("      → review with `sandbox-diff`, copy back with `sandbox-apply`,");
+console.log("        wipe with `sandbox-discard --yes`");
+console.log("  - volumes: portable-sandbox-home, -claude, -codex,");
+console.log("             portable-sandbox-deps-<slug>-<name>,");
+console.log("             portable-sandbox-services-logs-<slug>");
+log.out("to wipe per-target deps (forces fresh uv sync/npm install):");
+console.log("    docker volume ls --format '{{.Name}}' | grep ^portable-sandbox-deps- | xargs docker volume rm");

@@ -1,0 +1,547 @@
+#!/usr/bin/env node
+// portable-sandbox launcher.
+// Usage:
+//   sandbox-up [--config path/to/sandbox-config.yaml] [--target path] [cmd...]
+//
+// Defaults: --config ./sandbox-config.yaml, cmd = bash.
+
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+import { loadConfig } from "../lib/config.mjs";
+import { prepareWorkspace, resolveReadonlyMounts, targetSlug as computeTargetSlug } from "../lib/prepare-workspace.mjs";
+import { parseCliArgs } from "../lib/parse-cli-args.mjs";
+import { createLog } from "../lib/log.mjs";
+import { capture } from "../lib/run.mjs";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(HERE, "..");
+const log = createLog("sandbox-up");
+
+function printUsage() {
+  console.log(`Usage: sandbox-up [--config <path>] [--target <path>] [cmd...]
+  --config   sandbox-config.yaml path (default: ./sandbox-config.yaml)
+  --target   override the 'target' field in the config
+  cmd        command to run in the agent container (default: bash)
+
+Examples:
+  sandbox-up                              # bash, config in cwd
+  sandbox-up claude                       # claude REPL
+  sandbox-up --config ~/code/myapp/sandbox-config.yaml claude
+  sandbox-up --target ../other-repo bash
+`);
+}
+
+// Run inheriting stdio; abort the launcher with a logged error if the
+// command exits non-zero. Stays inline rather than moving to lib/run.mjs
+// because the failure path is coupled to this script's exit policy.
+function run(cmd, args, opts = {}) {
+  const r = spawnSync(cmd, args, { stdio: "inherit", ...opts });
+  if (r.status !== 0) {
+    log.err(`command failed: ${cmd} ${args.join(" ")}`);
+    process.exit(r.status || 1);
+  }
+  return r;
+}
+
+function dockerExists() {
+  const r = capture("docker", ["version", "--format", "{{.Server.Version}}"]);
+  return r.status === 0;
+}
+
+function ensureNetwork(name) {
+  const r = capture("docker", ["network", "inspect", name]);
+  if (r.status !== 0) {
+    run("docker", ["network", "create", "--internal", name]);
+  }
+}
+
+function ensureBridgeNetwork(name) {
+  const r = capture("docker", ["network", "inspect", name]);
+  if (r.status !== 0) {
+    run("docker", ["network", "create", name]);
+  }
+}
+
+function removeContainer(name) {
+  const r = capture("docker", ["ps", "-a", "--format", "{{.Names}}"]);
+  if ((r.stdout || "").split("\n").includes(name)) {
+    capture("docker", ["rm", "-f", name]);
+  }
+}
+
+// ---------- main ----------
+
+const args = parseCliArgs(process.argv.slice(2), {
+  flags: {
+    configPath:     { long: "--config", takesValue: true },
+    targetOverride: { long: "--target", takesValue: true },
+  },
+  rest: "cmd",
+  printHelp: printUsage,
+});
+
+if (!dockerExists()) {
+  log.err("docker is not available — start Docker Desktop first");
+  process.exit(2);
+}
+
+const configPath = args.configPath || path.resolve(process.cwd(), "sandbox-config.yaml");
+if (!existsSync(configPath)) {
+  log.err(`config not found: ${configPath}`);
+  console.error(`            copy portable-sandbox/sandbox-config.example.yaml and edit it.`);
+  process.exit(2);
+}
+
+const config = loadConfig(configPath);
+if (args.targetOverride) {
+  config.target = path.isAbsolute(args.targetOverride)
+    ? args.targetOverride
+    : path.resolve(process.cwd(), args.targetOverride);
+}
+
+if (!existsSync(config.target)) {
+  log.err(`target repo not found: ${config.target}`);
+  process.exit(2);
+}
+
+// Per-target slug used to name persistent dep volumes and the workspace dir.
+// Stable across runs for the same target path; different targets get different
+// volumes and a different workspace.
+const targetSlug = computeTargetSlug(config.target);
+
+log.out(`config: ${configPath}`);
+log.out(`target: ${config.target}`);
+log.out(`target-slug: ${targetSlug}`);
+
+// ---------- workspace copy ----------
+// Workspace is per-target stable. First launch copies from target; subsequent
+// launches reuse so the agent's in-progress work survives sandbox-down. Use
+// sandbox-discard to wipe and start fresh from target.
+
+const { dest: workspaceDir, reused } = prepareWorkspace(config);
+log.out(`workspace: ${workspaceDir}${reused ? " (reused)" : " (fresh copy)"}`);
+if (reused) {
+  console.log(`[sandbox-up]   → run sandbox-diff to see changes, sandbox-apply to copy back,`);
+  console.log(`[sandbox-up]     or sandbox-discard to wipe and start fresh.`);
+}
+
+// Drop-box for files the agent should pick up from the host (e.g. images
+// pasted from the host clipboard — terminals running inside the sandbox
+// can't receive ctrl+v attachments directly). Excluded from apply/diff/merge
+// so contents never round-trip back to the target.
+const attachmentsDir = path.join(workspaceDir, "tmp_attachments");
+mkdirSync(attachmentsDir, { recursive: true });
+log.out(`attachments: ${attachmentsDir}`);
+console.log(`[sandbox-up]   → drop files here from the host; agent sees them at /workspace/tmp_attachments`);
+console.log(`[sandbox-up]   → excluded from sandbox-apply / sandbox-diff (never copied to target)`);
+
+// Resolve readonly globs to per-path bind mounts. The kernel enforces these
+// as read-only regardless of file ownership inside the container.
+const readonlyRelPaths = resolveReadonlyMounts(workspaceDir, config.readonly);
+if (readonlyRelPaths.length > 0) {
+  log.out(`readonly overlays: ${readonlyRelPaths.join(", ")}`);
+}
+const readonlyMounts = readonlyRelPaths.map((rel) =>
+  `type=bind,src=${path.join(workspaceDir, rel)},dst=/workspace/${rel},readonly`
+);
+
+// Persistent dep volumes — survive sandbox-down, reused across launches so
+// uv sync / npm install only does real work when the manifest changed.
+// Pre-create an empty directory for each dep_volume path inside the workspace
+// copy so Docker has a mountpoint to overlay the named volume onto. Without
+// this, the broker (which mounts /workspace readonly) can't create the
+// mountpoint and fails with "read-only file system".
+const depMounts = config.dep_volumes.map((rel) => {
+  const safe = rel.replace(/[^A-Za-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const vol = `portable-sandbox-deps-${targetSlug}-${safe}`;
+  mkdirSync(path.join(workspaceDir, rel), { recursive: true });
+  return { volume: vol, dst: `/workspace/${rel}`, mount: `type=volume,src=${vol},dst=/workspace/${rel}` };
+});
+if (depMounts.length > 0) {
+  log.out(`dep volumes: ${depMounts.map((d) => d.volume).join(", ")}`);
+}
+
+// ---------- images ----------
+
+if (config.images.build_locally) {
+  log.out(`building images (build_locally=true)`);
+  run("docker", ["build", "-t", config.images.broker, "-f", path.join(ROOT, "images/broker.Dockerfile"), ROOT]);
+  run("docker", ["build", "-t", config.images.agent, "-f", path.join(ROOT, "images/agent.Dockerfile"), ROOT]);
+} else {
+  log.out(`using prebuilt images:`);
+  console.log(`             broker = ${config.images.broker}`);
+  console.log(`             agent  = ${config.images.agent}`);
+}
+
+// ---------- networks ----------
+
+const BROKER_NET = "portable-sandbox-broker-net"; // internal (no internet)
+const AGENT_NET  = "portable-sandbox-agent-net";  // bridge (internet)
+ensureNetwork(BROKER_NET);
+ensureBridgeNetwork(AGENT_NET);
+
+// ---------- compose services ----------
+// Reuse the target repo's docker-compose.yml. We bring up the requested
+// services (idempotent — no-op if already running) and then attach each one
+// to AGENT_NET with its service name as an alias. The agent reaches them as
+// `<service-name>:<port>` exactly as it would inside a compose project.
+// We never stop these — the user owns the compose lifecycle outside the sandbox.
+
+if (config.compose) {
+  if (!existsSync(config.compose.file)) {
+    log.err(`compose file not found: ${config.compose.file}`);
+    process.exit(2);
+  }
+  log.out(`compose: ${config.compose.file}`);
+
+  const composeBase = ["compose", "-f", config.compose.file];
+  const upArgs = [...composeBase, "up", "-d", ...config.compose.services];
+  run("docker", upArgs);
+
+  // Resolve effective service list (use what user asked for; otherwise all
+  // services declared in the compose file).
+  let services = config.compose.services;
+  if (services.length === 0) {
+    const r = capture("docker", [...composeBase, "config", "--services"]);
+    services = (r.stdout || "").trim().split("\n").filter(Boolean);
+  }
+
+  for (const svc of services) {
+    const psRes = capture("docker", [...composeBase, "ps", "-q", svc]);
+    const ids = (psRes.stdout || "").trim().split("\n").filter(Boolean);
+    if (ids.length === 0) {
+      log.err(`compose service '${svc}' has no running container — skipping`);
+      continue;
+    }
+    for (const id of ids) {
+      const r = capture(
+        "docker",
+        ["network", "connect", "--alias", svc, AGENT_NET, id],
+      );
+      // Idempotent: a re-launch hits "endpoint already exists" — fine.
+      if (r.status !== 0 && !(r.stderr || "").includes("already exists")) {
+        log.err(`could not attach ${svc} (${id.slice(0, 12)}): ${(r.stderr || "").trim()}`);
+      }
+    }
+    log.out(`compose: '${svc}' reachable from agent as '${svc}'`);
+  }
+}
+
+// ---------- broker ----------
+
+const BROKER_NAME = "portable-sandbox-broker";
+removeContainer(BROKER_NAME);
+
+// Build recipes.json that the broker will read. Secret host paths become
+// in-container paths under /run/secrets/<name>.env.
+const inContainerSecrets = {};
+const secretMounts = [];
+for (const s of config.secrets) {
+  if (!existsSync(s.hostPath)) {
+    log.err(`secret file not found: ${s.hostPath} (declared as '${s.name}')`);
+    process.exit(2);
+  }
+  const inContainer = `/run/secrets/${s.name}.env`;
+  inContainerSecrets[s.name] = inContainer;
+  secretMounts.push(`type=bind,src=${s.hostPath},dst=${inContainer},readonly`);
+}
+
+const recipesPayload = { secrets: inContainerSecrets, recipes: config.recipes };
+const recipesTmpDir = path.join(workspaceDir, ".sandbox-broker-state");
+mkdirSync(recipesTmpDir, { recursive: true });
+const recipesJsonPath = path.join(recipesTmpDir, "recipes.json");
+writeFileSync(recipesJsonPath, JSON.stringify(recipesPayload, null, 2));
+
+// Manifest of resolved readonly paths so the in-container `verify` tool tests
+// the paths the user actually configured (not a hardcoded guess). One path
+// per line, relative to /workspace.
+const readonlyManifestPath = path.join(recipesTmpDir, "readonly-paths.txt");
+writeFileSync(
+  readonlyManifestPath,
+  readonlyRelPaths.length > 0 ? readonlyRelPaths.join("\n") + "\n" : "",
+);
+
+const brokerArgs = [
+  "run", "-d",
+  "--name", BROKER_NAME,
+  "--network", BROKER_NET,
+  "--network-alias", "portable-sandbox-broker",
+  "--read-only",
+  "--tmpfs", "/tmp:rw,exec,nosuid,size=128m",
+  "--workdir", "/workspace",
+  "--env", "TEST_BROKER_RECIPES=/broker/recipes.json",
+  "--env", "TEST_BROKER_WORKSPACE=/workspace",
+  "--mount", `type=bind,src=${workspaceDir},dst=/workspace,readonly`,
+  "--mount", `type=bind,src=${recipesJsonPath},dst=/broker/recipes.json,readonly`,
+];
+for (const m of secretMounts) brokerArgs.push("--mount", m);
+// Broker also gets the readonly overlays so its view of /workspace matches
+// the agent's view exactly (defense-in-depth: the broker should not write
+// to the agent's workspace at all — recipes copy to /tmp before running).
+for (const m of readonlyMounts) brokerArgs.push("--mount", m);
+// Same dep volumes as the agent — recipes need to find .venv / node_modules.
+// Mounted read-only on the broker side: tests should read installed deps,
+// not install new ones.
+for (const d of depMounts) brokerArgs.push("--mount", `${d.mount},readonly`);
+brokerArgs.push(config.images.broker);
+
+log.out(`starting broker (${BROKER_NAME})`);
+run("docker", brokerArgs);
+
+// ---------- prep dep volumes (early) ----------
+// Named volumes are created empty and owned by root. The agent and services
+// containers both run as non-root (uid 999, the `agent` user baked into
+// images/agent.Dockerfile) and need to write into .venv / node_modules
+// during `uv sync`, `pnpm install`, and dev-server startup. So before the
+// services container boots — and before the install hook runs — we hand
+// ownership of each dep volume to the agent user.
+//
+// We do this by spawning a one-shot root container, mounting every dep
+// volume into it, and running `chown -R agent:agent <paths>`. Cheap,
+// idempotent, and a no-op once the volume is already owned correctly.
+const HOME_VOL = "portable-sandbox-home";
+
+if (depMounts.length > 0) {
+  const chownArgs = [
+    "run", "--rm", "--user", "0:0",
+    ...depMounts.flatMap((d) => ["--mount", d.mount]),
+    "--entrypoint", "chown",
+    config.images.agent,
+    "-R", "agent:agent",
+    ...depMounts.map((d) => d.dst),
+  ];
+  run("docker", chownArgs);
+}
+
+// ---------- services container ----------
+// Long-running dev processes (uvicorn --reload, pnpm dev, schedulers, etc.)
+// that need real .env, real internet, and host port forwards. Lives next to
+// the broker but is a different threat model: it's "trusted" — secrets land
+// in its process env. The agent talks to it over HTTP and can only operate
+// on declared service names; it never docker-execs in.
+
+const SERVICES_NAME = "portable-sandbox-services";
+const SERVICES_ALIAS = "portable-sandbox-services";
+const SERVICES_LOGS_VOL = `portable-sandbox-services-logs-${targetSlug}`;
+const SERVICES_TOOLS_VOL = `portable-sandbox-services-tools-${targetSlug}`;
+removeContainer(SERVICES_NAME);
+
+const haveServices = Object.keys(config.services).length > 0
+  || config.tools_install.length > 0
+  || config.mounts.length > 0;
+
+let servicesImage = config.images.services;
+if (config.services_image && config.services_image.extends) {
+  const dfPath = config.services_image.extends;
+  if (!existsSync(dfPath)) {
+    log.err(`services_image.extends not found: ${dfPath}`);
+    process.exit(2);
+  }
+  servicesImage = `portable-sandbox-services-${targetSlug}:local`;
+  log.out(`building services image from ${dfPath} -> ${servicesImage}`);
+  run("docker", ["build", "-t", servicesImage, "-f", dfPath, path.dirname(dfPath)]);
+}
+
+if (haveServices) {
+  // Generate the services config the control server reads. Same shape as the
+  // broker's recipes.json: secrets are { name -> in-container path }, the
+  // server loads + parses the .env files itself.
+  const servicesPayload = {
+    secrets: inContainerSecrets,
+    services: config.services,
+    tools_install: config.tools_install,
+  };
+  const servicesJsonPath = path.join(recipesTmpDir, "services.json");
+  writeFileSync(servicesJsonPath, JSON.stringify(servicesPayload, null, 2));
+
+  // Host port forwards declared per-service are published from THIS container.
+  const servicePortArgs = [];
+  for (const [name, spec] of Object.entries(config.services)) {
+    for (const p of spec.ports) servicePortArgs.push("-p", p);
+    if (spec.ports.length > 0) {
+      log.out(`services: '${name}' publishes ${spec.ports.join(", ")} -> host`);
+    }
+  }
+
+  // User-declared host mounts (gws creds, aws creds, kube config, ...).
+  const userMountArgs = [];
+  for (const m of config.mounts) {
+    if (!existsSync(m.src)) {
+      log.err(`mounts: source not found: ${m.src}`);
+      process.exit(2);
+    }
+    const opts = m.readonly ? ",readonly" : "";
+    userMountArgs.push("--mount", `type=bind,src=${m.src},dst=${m.dst}${opts}`);
+    log.out(`services mount: ${m.src} -> ${m.dst}${m.readonly ? " (ro)" : ""}`);
+  }
+
+  // Same dep volumes as the agent, mounted writable on the services side —
+  // some dev servers install bits at runtime (corepack downloading pnpm on
+  // first use, `uv` materializing extras, etc.). Each child the control
+  // server spawns drops privileges to uid 999 (the agent user — see
+  // SERVICES_RUN_UID below), so files those processes create end up
+  // agent-owned and the agent shell can still edit them.
+  const servicesAgentNetArgs = ["--network", AGENT_NET, "--network-alias", SERVICES_ALIAS];
+
+  const servicesPath = path.join(ROOT, "services");
+
+  const servicesArgs = [
+    "run", "-d",
+    "--name", SERVICES_NAME,
+    ...servicesAgentNetArgs,
+    ...servicePortArgs,
+    // NOT --read-only: control server writes to /var/log/services and
+    // tools_install may install to /usr/local/bin. Workspace ownership is
+    // protected by uid mapping on spawn, not by filesystem mode.
+    "--tmpfs", "/tmp:rw,exec,nosuid,size=256m",
+    "--workdir", "/workspace",
+    "--user", "0:0",
+    "--env", "HOME=/root",
+    "--env", `TERM=${process.env.TERM || "xterm-256color"}`,
+    "--env", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "--env", "SERVICES_CONFIG=/services/config.json",
+    "--env", "SERVICES_LOG_DIR=/var/log/services",
+    // These two env vars tell the services control plane what uid/gid to
+    // drop to when it spawns each declared service. They MUST match the
+    // `agent` user baked into images/agent.Dockerfile. On debian-slim,
+    // `useradd --system` picks 999 because uid 1000 is already taken by
+    // the `node` user from the base image. The dep volumes are chowned to
+    // the same uid (see chownArgs above), so service children inherit
+    // ownership and can write to .venv / node_modules. If you ever swap
+    // the base image or the user-creation step in the Dockerfile, set
+    // these to whatever `id -u agent` reports inside the agent image.
+    "--env", "SERVICES_RUN_UID=999",
+    "--env", "SERVICES_RUN_GID=999",
+    "--env", "UV_LINK_MODE=copy",
+    "--mount", `type=bind,src=${workspaceDir},dst=/workspace`,
+    ...readonlyMounts.flatMap((m) => ["--mount", m]),
+    ...depMounts.flatMap((d) => ["--mount", d.mount]),
+    // Share /home/agent with the install hook + agent container. The install
+    // hook populates this with uv's downloaded Python interpreter and pnpm/
+    // corepack caches; the dep volumes (.venv / node_modules) symlink into
+    // those caches. Without this mount, services starts with an empty home,
+    // sees a dangling .venv/bin/python3 symlink, and uv rebuilds .venv with
+    // only the root package's deps — losing uvicorn and friends.
+    "--mount", `type=volume,src=${HOME_VOL},dst=/home/agent`,
+    "--mount", `type=bind,src=${servicesPath}/services-server.mjs,dst=/services/server.mjs,readonly`,
+    "--mount", `type=bind,src=${servicesJsonPath},dst=/services/config.json,readonly`,
+    "--mount", `type=volume,src=${SERVICES_LOGS_VOL},dst=/var/log/services`,
+    ...userMountArgs,
+  ];
+  for (const m of secretMounts) servicesArgs.push("--mount", m);
+  servicesArgs.push("--entrypoint", "node", servicesImage, "/services/server.mjs");
+
+  log.out(`starting services container (${SERVICES_NAME})`);
+  run("docker", servicesArgs);
+
+  // Tail tools_install output to the launcher console so the user sees it.
+  if (config.tools_install.length > 0) {
+    log.out(`tools_install running inside services container — see "docker logs ${SERVICES_NAME}"`);
+  }
+}
+
+// ---------- install hook ----------
+// Run each install command once, non-interactively, in a throwaway agent
+// container with the same workspace + dep volumes mounted. No secrets, no
+// broker. If anything fails we abort before opening the user's session.
+
+if (config.install.length > 0) {
+  for (const cmd of config.install) {
+    console.log(`[install] ${cmd.join(" ")}`);
+    const installArgs = [
+      "run", "--rm",
+      "--network", AGENT_NET,
+      "--read-only",
+      "--tmpfs", "/tmp:rw,exec,nosuid,size=256m",
+      "--workdir", "/workspace",
+      "--env", "HOME=/home/agent",
+      "--env", "UV_LINK_MODE=copy",
+      "--mount", `type=bind,src=${workspaceDir},dst=/workspace`,
+      ...readonlyMounts.flatMap((m) => ["--mount", m]),
+      ...depMounts.flatMap((d) => ["--mount", d.mount]),
+      "--mount", `type=volume,src=${HOME_VOL},dst=/home/agent`,
+      config.images.agent,
+      ...cmd,
+    ];
+    const r = spawnSync("docker", installArgs, { stdio: "inherit" });
+    if (r.status !== 0) {
+      console.error(`[install] command failed: ${cmd.join(" ")}`);
+      console.error(`[install] aborting — fix the install error or remove the entry from sandbox-config.yaml.`);
+      process.exit(r.status || 1);
+    }
+  }
+}
+
+// ---------- agent ----------
+
+const AGENT_NAME = `portable-sandbox-agent-${process.pid}`;
+
+// Persist Claude/Codex credentials across runs.
+const CLAUDE_VOL  = "portable-sandbox-claude";
+const CODEX_VOL   = "portable-sandbox-codex";
+
+const cmd = args.cmd.length > 0 ? args.cmd : ["bash"];
+const tty = process.stdin.isTTY ? ["-it"] : [];
+
+// Published ports — for dev servers (pnpm dev, vite, etc.) the agent runs
+// inside the container that you want to open from a browser on the host.
+// Service ports declared in docker-compose.yml are published by compose
+// itself, so they don't need to be repeated in `ports:`.
+if (config.ports.length > 0) {
+  log.out(`publishing agent ports: ${config.ports.join(", ")}`);
+}
+const portArgs = config.ports.flatMap((p) => ["-p", p]);
+
+const agentArgs = [
+  "run", "--rm", ...tty,
+  "--name", AGENT_NAME,
+  "--network", AGENT_NET,
+  ...portArgs,
+  "--read-only",
+  "--tmpfs", "/tmp:rw,exec,nosuid,size=256m",
+  "--workdir", "/workspace",
+  "--env", "HOME=/home/agent",
+  "--env", `TERM=${process.env.TERM || "xterm-256color"}`,
+  "--env", "PATH=/sandbox-tools:/workspace/scripts:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+  "--env", "DISABLE_AUTOUPDATER=1",
+  "--env", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+  "--env", "SAFE_TEST_BROKER_URL=http://portable-sandbox-broker:8765",
+  "--env", `SAFE_SERVICE_URL=http://${SERVICES_ALIAS}:9999`,
+  "--mount", `type=bind,src=${workspaceDir},dst=/workspace`,
+  // Per-path readonly overlays — kernel-enforced, independent of file mode.
+  ...readonlyMounts.flatMap((m) => ["--mount", m]),
+  // Persistent dep volumes on top of /workspace (e.g. .venv, node_modules).
+  ...depMounts.flatMap((d) => ["--mount", d.mount]),
+  "--mount", `type=bind,src=${path.join(ROOT, "tools")},dst=/sandbox-tools,readonly`,
+  "--mount", `type=volume,src=${HOME_VOL},dst=/home/agent`,
+  "--mount", `type=volume,src=${CLAUDE_VOL},dst=/home/agent/.claude`,
+  "--mount", `type=volume,src=${CODEX_VOL},dst=/home/agent/.codex`,
+  config.images.agent,
+  ...cmd,
+];
+
+// Create the container (stopped) attached to AGENT_NET, then connect the
+// internal BROKER_NET *before* `docker start` so the agent can reach the
+// broker from its very first shell command. An earlier version did this
+// with a setTimeout after a blocking `docker run`, but spawnSync blocks the
+// event loop and the connect never fired during the agent's lifetime — the
+// agent ran with the broker network never attached at all.
+const createArgs = ["create", ...agentArgs.slice(1)];
+const createRes = capture("docker", createArgs);
+if (createRes.status !== 0) {
+  log.err(`docker create failed: ${(createRes.stderr || "").trim()}`);
+  process.exit(createRes.status || 1);
+}
+const connRes = capture("docker", ["network", "connect", BROKER_NET, AGENT_NAME]);
+if (connRes.status !== 0) {
+  log.err(`could not connect broker network: ${(connRes.stderr || "").trim()}`);
+}
+
+log.out(`starting agent (${AGENT_NAME}) — running: ${cmd.join(" ")}`);
+const startFlags = tty.length > 0 ? ["-ai"] : ["-a"];
+const r = spawnSync("docker", ["start", ...startFlags, AGENT_NAME], { stdio: "inherit" });
+log.out(`agent exited (${r.status ?? "signal"}). broker still running — sandbox-down to stop.`);
+process.exit(r.status ?? 0);

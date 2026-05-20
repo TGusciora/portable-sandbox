@@ -1,0 +1,63 @@
+#!/usr/bin/env node
+// portable-sandbox: review changes the agent made.
+// Usage:
+//   sandbox-diff [--config path/to/sandbox-config.yaml]
+//
+// Shows a unified diff between the original target repo and the per-target
+// workspace. Excludes hidden/, readonly/, dep_volume paths, .git, and the
+// internal .sandbox-broker-state/ dir so you only see real agent changes.
+
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { loadConfig } from "../lib/config.mjs";
+import { workspacePathFor } from "../lib/prepare-workspace.mjs";
+import { excludeNames } from "../lib/exclude-names.mjs";
+import { parseCliArgs } from "../lib/parse-cli-args.mjs";
+import { createLog } from "../lib/log.mjs";
+
+const log = createLog("sandbox-diff");
+
+const args = parseCliArgs(process.argv.slice(2), {
+  flags: {
+    configPath: { long: "--config", takesValue: true },
+  },
+  printHelp: () => console.log("Usage: sandbox-diff [--config <path>]"),
+});
+
+const configPath = args.configPath || path.resolve(process.cwd(), "sandbox-config.yaml");
+if (!existsSync(configPath)) {
+  log.err(`config not found: ${configPath}`);
+  process.exit(2);
+}
+
+const config = loadConfig(configPath);
+const workspaceDir = workspacePathFor(config.target);
+
+if (!existsSync(workspaceDir)) {
+  log.err(`no workspace yet for ${config.target}`);
+  console.error(`              run sandbox-up first.`);
+  process.exit(2);
+}
+
+const excludes = excludeNames(config);
+const diffArgs = ["-urN"];
+for (const name of excludes) diffArgs.push("-x", name);
+diffArgs.push(config.target, workspaceDir);
+
+log.err(`target:    ${config.target}`);
+log.err(`workspace: ${workspaceDir}`);
+log.err(`excludes:  ${excludes.join(", ")}`);
+console.error("");
+
+const r = spawnSync("diff", diffArgs, { stdio: "inherit" });
+// diff exits: 0 = identical, 1 = differences, 2 = trouble
+if (r.status === 2) {
+  log.err("diff failed");
+  process.exit(2);
+}
+if (r.status === 0) {
+  log.err("no changes — workspace matches target.");
+}
+process.exit(0);

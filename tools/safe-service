@@ -1,0 +1,174 @@
+#!/usr/bin/env node
+// In-container client for the services control plane. Lets the agent start,
+// stop, inspect, and tail logs for long-running dev services declared in
+// sandbox-config.yaml. The services container holds the real secrets; this
+// client only sees names, pids, and stdout/stderr.
+//
+// Usage:
+//   safe-service list
+//   safe-service status
+//   safe-service start  <name>
+//   safe-service stop   <name> [--signal SIGTERM]
+//   safe-service restart <name>
+//   safe-service logs   <name> [--tail N] [--follow|-f]
+
+import process from "node:process";
+
+const URL_BASE = process.env.SAFE_SERVICE_URL || "http://portable-sandbox-services:9999";
+
+function fail(msg, code = 1) { console.error(msg); process.exit(code); }
+
+function parseFlags(argv) {
+  const out = { positional: [], flags: {} };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--follow" || a === "-f") { out.flags.follow = true; continue; }
+    if (a === "--tail") { out.flags.tail = Number(argv[++i]); continue; }
+    if (a === "--signal") { out.flags.signal = argv[++i]; continue; }
+    if (a.startsWith("--")) fail(`unknown flag: ${a}`);
+    out.positional.push(a);
+  }
+  return out;
+}
+
+async function get(pathname) {
+  let res;
+  try {
+    res = await fetch(new URL(pathname, URL_BASE));
+  } catch (err) {
+    fail(`could not reach services control plane at ${URL_BASE}: ${err.message}`);
+  }
+  const text = await res.text();
+  let body;
+  try { body = JSON.parse(text); } catch { body = { _raw: text }; }
+  return { ok: res.ok, status: res.status, body };
+}
+
+async function post(pathname, payload) {
+  let res;
+  try {
+    res = await fetch(new URL(pathname, URL_BASE), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload || {}),
+    });
+  } catch (err) {
+    fail(`could not reach services control plane at ${URL_BASE}: ${err.message}`);
+  }
+  const body = await res.json().catch(() => ({}));
+  return { ok: res.ok, status: res.status, body };
+}
+
+async function cmdList() {
+  const r = await get("/list");
+  if (!r.ok) fail(r.body.error || `error ${r.status}`);
+  if (r.body.services.length === 0) {
+    console.log("(no services declared in sandbox-config.yaml)");
+    return;
+  }
+  for (const n of r.body.services) console.log(n);
+}
+
+async function cmdStatus() {
+  const r = await get("/status");
+  if (!r.ok) fail(r.body.error || `error ${r.status}`);
+  const rows = r.body.services;
+  if (rows.length === 0) { console.log("(no services declared)"); return; }
+  const pad = (s, n) => String(s ?? "").padEnd(n);
+  console.log(pad("NAME", 16) + pad("STATE", 10) + pad("PID", 8) + pad("EXIT", 8) + "STARTED");
+  for (const r of rows) {
+    console.log(
+      pad(r.name, 16) + pad(r.state, 10) + pad(r.pid ?? "-", 8) +
+      pad(r.exit_code == null ? "-" : r.exit_code, 8) + (r.started_at || "")
+    );
+  }
+}
+
+async function cmdStart(name) {
+  if (!name) fail("usage: safe-service start <name>");
+  const r = await post(`/start/${encodeURIComponent(name)}`);
+  if (!r.ok) fail(r.body.error || `error ${r.status}`);
+  console.log(`started ${r.body.name} (pid ${r.body.pid})`);
+}
+
+async function cmdStop(name, signal) {
+  if (!name) fail("usage: safe-service stop <name> [--signal SIGTERM]");
+  const r = await post(`/stop/${encodeURIComponent(name)}`, signal ? { signal } : {});
+  if (!r.ok) fail(r.body.error || `error ${r.status}`);
+  console.log(`stopped ${r.body.name} (${r.body.signaled})`);
+}
+
+async function cmdRestart(name) {
+  if (!name) fail("usage: safe-service restart <name>");
+  // Best-effort stop, then start. Ignore stop errors (the service might not
+  // be running, which is fine for a restart).
+  await post(`/stop/${encodeURIComponent(name)}`);
+  // 750ms grace period before the start. SIGTERM returns synchronously the
+  // moment the signal is delivered, but the OS still needs a beat to actually
+  // tear the process down — release the TCP listen socket, drop file locks,
+  // close DB connections. Without the pause, `start` races and the new
+  // process gets EADDRINUSE on the port the old one hadn't yet released.
+  // 750ms is empirical: comfortably covers uvicorn / vite / pnpm dev on
+  // a loaded laptop without making restart feel slow.
+  await new Promise((r) => setTimeout(r, 750));
+  const r = await post(`/start/${encodeURIComponent(name)}`);
+  if (!r.ok) fail(r.body.error || `error ${r.status}`);
+  console.log(`restarted ${r.body.name} (pid ${r.body.pid})`);
+}
+
+async function cmdLogs(name, { tail, follow }) {
+  if (!name) fail("usage: safe-service logs <name> [--tail N] [--follow]");
+  const qs = new URLSearchParams();
+  if (tail) qs.set("tail", String(tail));
+  if (follow) qs.set("follow", "true");
+  const url = new URL(`/logs/${encodeURIComponent(name)}${qs.toString() ? `?${qs}` : ""}`, URL_BASE);
+
+  let res;
+  try { res = await fetch(url); }
+  catch (err) { fail(`could not reach services control plane at ${URL_BASE}: ${err.message}`); }
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    fail(body.error || `error ${res.status}`);
+  }
+
+  // Stream to stdout.
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    process.stdout.write(decoder.decode(value, { stream: true }));
+  }
+}
+
+const [op, ...rest] = process.argv.slice(2);
+const parsed = parseFlags(rest);
+
+switch (op) {
+  case "list":    await cmdList(); break;
+  case "status":  await cmdStatus(); break;
+  case "start":   await cmdStart(parsed.positional[0]); break;
+  case "stop":    await cmdStop(parsed.positional[0], parsed.flags.signal); break;
+  case "restart": await cmdRestart(parsed.positional[0]); break;
+  case "logs":    await cmdLogs(parsed.positional[0], { tail: parsed.flags.tail, follow: parsed.flags.follow }); break;
+  case undefined:
+  case "-h":
+  case "--help":
+    console.log(`Control plane for long-running dev services (uvicorn, pnpm dev,
+schedulers, …) that live in the services container. Those processes are
+where the real .env values are injected — the agent shell never sees them.
+This client only talks to the control plane over HTTP, so it can read names,
+pids, exit codes, and stdout/stderr, but not the secret environment.
+
+Usage:
+  safe-service list                          declared service names
+  safe-service status                        running state of each
+  safe-service start   <name>                start a declared service
+  safe-service stop    <name> [--signal X]   send signal (default SIGTERM)
+  safe-service restart <name>                stop then start
+  safe-service logs    <name> [--tail N] [--follow|-f]
+`);
+    break;
+  default: fail(`unknown command: ${op}`);
+}

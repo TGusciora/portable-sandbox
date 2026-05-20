@@ -1,0 +1,225 @@
+# portable-sandbox config
+# -----------------------
+# Copy this file next to your target repo (or anywhere) and edit.
+# Launch with:
+#   portable-sandbox/bin/sandbox-up --config /path/to/sandbox-config.yaml [cmd...]
+# If --config is omitted, sandbox-up looks for sandbox-config.yaml in the
+# current directory, then in the target repo.
+
+# ---- Target repo ----
+# Absolute, or relative to THIS config file.
+target: ../../plugin-platform-copy
+
+# ---- Images ----
+# build_locally=true  : build from ./images/*.Dockerfile (good for training,
+#                       no registry login needed).
+# build_locally=false : pull the digests below from a registry. Pin to a
+#                       digest in production. Switch to a hardened distroless
+#                       image (e.g. cgr.dev/chainguard/node) for stronger
+#                       isolation; broker can use a minimal base since it
+#                       does not need bash/git/etc.
+images:
+  build_locally: true
+  agent: portable-sandbox-agent:local
+  broker: portable-sandbox-broker:local
+
+# ---- Workspace policy ----
+# Applied to the throwaway COPY of the target repo that the agent sees.
+# The original repo is never touched.
+#
+#   hidden:   file is filtered out during copy. Agent literally cannot see it.
+#   readonly: file is copied but chmod 0444 (files) / 0555 (dirs).
+#   writable: documentation only — anything not hidden/readonly is writable.
+#
+# Patterns evaluate in order, gitignore-style: a leading `!` re-allows a path
+# matched by an earlier hide pattern. Use this to keep template files like
+# .env.example visible while still hiding real .env variants.
+hidden:
+  - .env
+  - .env.*
+  - "!.env.example"
+  - "!.env.sample"
+  - .ssh
+  - .aws
+  - secrets/**
+  - .git
+readonly:
+  - apps/commerce-web/src/**
+  - apps/offers-web/src/**
+
+# NOTE: All other locations are write-able by definition
+    
+# NOTE: manifests (pyproject.toml, package.json, uv.lock, etc.) are
+# intentionally NOT readonly — the agent needs to add/upgrade libraries
+# during a session via `uv add foo` / `npm install foo`. Their installed
+# artifacts persist in named volumes (see `dep_volumes` below) so you don't
+# re-download deps on every launch.
+# writable:
+#  - src/**
+#  - tests/**
+#  - pyproject.toml
+#  - uv.lock
+#  - package.json
+#  - package-lock.json
+#  - requirements*.txt
+
+# ---- Dependencies ----
+# `install` runs once at launch (before opening the agent shell). Use it to
+# materialize the project's deps into the workspace. Commands run inside
+# the agent container, cwd = /workspace, with no secrets.
+#
+# `dep_volumes` are persistent named Docker volumes mounted on top of the
+# workspace at the given paths. They survive sandbox-down and are reused on
+# next launch, so `uv sync` / `npm install` only does real work when the
+# manifest changes.
+install:
+  - [uv, sync, --all-packages, --all-groups, --all-extras]
+  - [pnpm, install]
+  # - [npm, install]
+
+dep_volumes:
+  - .venv
+  - node_modules
+
+# ---- Secrets ----
+# Host paths to .env files the BROKER will load. The AGENT never sees these.
+# Paths can be absolute, ~-expanded, or relative to this config file.
+secrets:
+  - name: app_env
+    path: ../../plugin-platform-copy/.env
+  # - name: stripe_test
+  #   path: ~/.stripe/test_key
+
+# ---- Ports (agent container) ----
+# Use this only for ad-hoc binds you do *inside the agent shell* (e.g. a
+# quick `python -m http.server` while poking around). For declared dev
+# servers, use `services[*].ports` — those publish from the services
+# container, which is where the secrets actually live.
+#
+# Important: dev servers must bind to 0.0.0.0 inside the container, NOT
+# 127.0.0.1 — otherwise docker can't forward the port to your host.
+#
+# A host port can only be bound once across agent + services + compose, so
+# don't duplicate anything that's already declared elsewhere.
+ports: []
+  # - "3000:3000"
+
+# ---- Compose services ----
+# Reuse the target repo's docker-compose.yml. sandbox-up will:
+#   1. `docker compose -f <file> up -d <services>` (no-op if already up)
+#   2. Connect each running service to the agent network with its service
+#      name as alias. Agent reaches them as `<service>:<port>`.
+# sandbox-down disconnects them but does NOT stop them — you stay in charge
+# of the compose lifecycle.
+#
+# Omit `services:` to bring up every service the compose file declares.
+compose:
+  file: ../../plugin-platform-copy/infra/compose/docker-compose.yml
+  services:
+    - postgres
+    # - redis
+
+# ---- Recipes ----
+# Named privileged actions the agent is allowed to invoke via:
+#   safe-test <recipe-name>
+# The broker runs the command with the listed secrets injected as env vars
+# and returns stdout/stderr/exitcode (with secret values redacted from output).
+# Command is exec'd directly (no shell), so no shell injection.
+recipes:
+  integration:
+    command: [pnpm, test]
+    secrets: [app_env]
+  python_secret_check:
+    command: [python3, tests/secret_check.py]
+    secrets: [app_env]
+  mission_sync_todoist:
+    command: [uv, run, ppctl, mission, sync, todoist]
+    secrets: [app_env]
+    timeoutSec: 300
+  # migrate_dry_run:
+  #   command: [npx, prisma, migrate, diff]
+  #   secrets: [app_env]
+
+# ---- Services ----
+# Long-running processes (uvicorn --reload, pnpm dev, schedulers) that need
+# secrets, internet, and host port forwards. They run inside a separate
+# "services" container next to the broker. The agent talks to them via:
+#
+#   safe-service list                       # declared service names
+#   safe-service start  backend             # start a service in the background
+#   safe-service stop   backend
+#   safe-service status                     # running state of each
+#   safe-service logs   backend [--follow]  # tail stdout/stderr
+#
+# Each service declares:
+#   command      argv (no shell). Exec'd directly inside the services container.
+#   secrets      bundle names from top-level `secrets:`. Injected as env vars
+#                only into this child process — never into the agent shell.
+#   ports        host:container forwards published from the services container.
+#   cwd          working directory inside the container (default /workspace).
+#   env          extra non-secret env vars to set for this service.
+#
+# The services container has internet (so OAuth / API calls work) and shares
+# /workspace with the agent (so --reload picks up edits live).
+services:
+  backend:
+    command:
+      - uv
+      - run
+      - uvicorn
+      - plugin_platform.app:create_app
+      - --factory
+      - --reload
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+    secrets: [app_env]
+    ports: ["8000:8000"]
+  mission:
+    command: [pnpm, mission:dev, --host, "0.0.0.0"]
+    secrets: [app_env]
+    ports: ["5173:5173"]
+  offer:
+    command: [pnpm, offer:dev, --host, "0.0.0.0"]
+    secrets: [app_env]
+    ports: ["5174:5174"]
+  commerce:
+    command: [pnpm, commerce:dev, --host, "0.0.0.0"]
+    secrets: [app_env]
+    ports: ["5175:5175"]
+
+# ---- Tools install ----
+# Runs once at services-container startup (as root, inside the container)
+# to provision CLIs the declared services need (gws, stripe, terraform, ...).
+# `check` is an argv that returns 0 if the tool is already present — when it
+# succeeds the install step is skipped. Failures abort sandbox-up unless
+# `optional: true`.
+tools_install:
+  # - name: stripe
+  #   check: [which, stripe]
+  #   install:
+  #     - [bash, -c, "curl -L https://github.com/stripe/stripe-cli/releases/download/v1.21.8/stripe_1.21.8_linux_x86_64.tar.gz | tar -xz -C /usr/local/bin stripe"]
+  #   optional: true
+
+# ---- Mounts (services container) ----
+# Host paths bind-mounted into the SERVICES container only — never into the
+# agent. Use for credentials that don't fit in a .env file: OAuth token
+# directories (~/.config/google-workspace-cli), cloud creds (~/.aws), cluster
+# configs (~/.kube), or SSH keys (~/.ssh) needed by a long-running dev tool.
+#
+# Why services-only: the agent is the part Claude controls and is treated as
+# untrusted. Keeping these mounts off the agent means a compromised agent has
+# no path to read your AWS keys or kube config, even though declared services
+# can still use them. Default `readonly: true` makes them harder to mutate.
+mounts: []
+  # - { src: ~/.aws,  dst: /home/agent/.aws,  readonly: true }
+  # - { src: ~/.kube, dst: /home/agent/.kube, readonly: true }
+
+# ---- Services image (escape hatch) ----
+# By default the services container reuses the agent image. If you need a
+# tool that genuinely can't be installed at runtime (apt sources, kernel
+# capabilities), point `extends:` at a Dockerfile that FROMs the agent image.
+# sandbox-up will build it per-target and use the result instead.
+# services_image:
+#   extends: ./services.Dockerfile

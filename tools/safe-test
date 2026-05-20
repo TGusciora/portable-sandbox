@@ -1,0 +1,40 @@
+#!/usr/bin/env node
+// In-container client that asks the broker to run a named recipe.
+// The agent never sees the secrets the broker injects; only stdout/stderr.
+// Usage: safe-test <recipe-name>
+
+import process from "node:process";
+
+const url = process.env.SAFE_TEST_BROKER_URL || "http://portable-sandbox-broker:8765";
+const recipe = process.argv[2];
+
+function fail(msg) { console.error(msg); process.exit(1); }
+
+if (!recipe) fail("Usage: safe-test <recipe>");
+if (!/^[a-z][a-z0-9_-]*$/i.test(recipe)) fail(`Rejected unsafe recipe name: ${recipe}`);
+
+let res;
+try {
+  res = await fetch(new URL("/run", url), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ recipe }),
+  });
+} catch (err) {
+  fail(`could not reach broker at ${url}: ${err.message}`);
+}
+
+const result = await res.json().catch(() => ({}));
+if (!res.ok) fail(result.error || `broker rejected recipe: ${recipe}`);
+
+console.log(`recipe accepted: ${result.recipe}`);
+console.log(`command:         ${Array.isArray(result.command) ? result.command.join(" ") : result.command}`);
+console.log(`exit code:       ${result.exitCode}`);
+if (result.timedOut) console.log("** timed out **");
+console.log("stdout:");
+for (const l of result.stdout || []) console.log("  " + l);
+if ((result.stderr || []).length) {
+  console.log("stderr:");
+  for (const l of result.stderr) console.error("  " + l);
+}
+process.exit(result.exitCode || 0);

@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# Verification checklist — runs inside the agent container to prove the
+# sandbox is doing what we promised. Designed for training demos: each check
+# prints PASS or FAIL with the actual observed output.
+#
+# Usage:  verify              # run all checks
+#         verify <name>       # run one (e.g. `verify hidden_env`)
+
+set -u
+
+BROKER_URL="${SAFE_TEST_BROKER_URL:-http://portable-sandbox-broker:8765}"
+SERVICES_URL="${SAFE_SERVICE_URL:-http://portable-sandbox-services:9999}"
+PASS=0
+FAIL=0
+
+pass() { printf "  \033[32mPASS\033[0m %s\n" "$1"; PASS=$((PASS+1)); }
+fail() { printf "  \033[31mFAIL\033[0m %s\n    -> %s\n" "$1" "$2"; FAIL=$((FAIL+1)); }
+head() { printf "\n\033[1m%s\033[0m\n" "$1"; }
+
+check_hidden_env() {
+  head "1. Hidden secrets are not in the workspace"
+  if [ -e /workspace/.env ]; then
+    fail "/workspace/.env should not exist" "found: $(ls -l /workspace/.env)"
+  else
+    pass "/workspace/.env not present"
+  fi
+  # Whitelist .env.example / .env.sample — those are conventional templates
+  # with placeholder values, intentionally copied into the workspace so the
+  # agent can see what env vars the project expects.
+  local hits
+  hits=$(find /workspace -name '.env*' \
+    -not -name '.env.example' \
+    -not -name '.env.sample' \
+    -not -path '*/node_modules/*' 2>/dev/null)
+  if [ -n "$hits" ]; then
+    fail "real .env files leaked into workspace" "$hits"
+  else
+    pass "no real .env files in workspace (.env.example/.sample allowed)"
+  fi
+}
+
+check_env_vars() {
+  head "2. Process env has no secret-like values"
+  local hits
+  hits=$(env | grep -iE 'key|secret|token|password|api' | grep -viE 'PATH|TERM|^_|XDG|DISABLE_AUTOUPDATER|CLAUDE_CODE_DISABLE|HOSTNAME|SAFE_TEST_BROKER_URL')
+  if [ -n "$hits" ]; then
+    fail "env vars leaking secret-like names" "$hits"
+  else
+    pass "no secret-like env vars"
+  fi
+}
+
+check_run_secrets() {
+  head "3. /run/secrets is not visible inside the agent"
+  if [ -d /run/secrets ]; then
+    local listing
+    listing=$(ls -A /run/secrets 2>/dev/null)
+    if [ -n "$listing" ]; then
+      fail "/run/secrets contains files" "$listing"
+    else
+      pass "/run/secrets exists but is empty"
+    fi
+  else
+    pass "/run/secrets does not exist in the agent"
+  fi
+}
+
+check_broker_raw_endpoints() {
+  head "4. Broker refuses raw secret reads"
+  for ep in /raw-env /secrets /env; do
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" "${BROKER_URL}${ep}")
+    if [ "$code" = "403" ] || [ "$code" = "404" ]; then
+      pass "GET ${ep} -> ${code}"
+    else
+      fail "GET ${ep} should be 403/404" "got ${code}"
+    fi
+  done
+}
+
+check_broker_health() {
+  head "5. Broker is reachable for legitimate calls"
+  local body
+  body=$(curl -s "${BROKER_URL}/health")
+  if echo "$body" | grep -q '"ok": *true'; then
+    pass "broker /health returns ok"
+  else
+    fail "broker /health" "$body"
+  fi
+
+  local recipes
+  recipes=$(curl -s "${BROKER_URL}/recipes")
+  if echo "$recipes" | grep -q '"recipes"'; then
+    pass "broker /recipes lists names: ${recipes}"
+  else
+    fail "broker /recipes" "$recipes"
+  fi
+}
+
+check_readonly_root() {
+  head "6. Root filesystem is read-only"
+  if echo x > /etc/portable-sandbox-test 2>/tmp/err; then
+    fail "could write to /etc" "$(cat /tmp/err)"
+    rm -f /etc/portable-sandbox-test
+  else
+    pass "writes to /etc rejected"
+  fi
+}
+
+check_readonly_paths() {
+  head "7. Read-only workspace paths cannot be modified (kernel-enforced)"
+  # The list of paths we test here comes from a manifest written by
+  # sandbox-up. At launch, sandbox-up takes the `readonly:` patterns from
+  # sandbox-config.yaml, expands the globs against the real workspace files,
+  # and writes one resolved relative path per line into the manifest below.
+  # That means this check verifies the config the user actually shipped —
+  # not a hardcoded guess — and it stays in sync automatically when the
+  # config changes.
+  local manifest=/workspace/.sandbox-broker-state/readonly-paths.txt
+  if [ ! -f "$manifest" ]; then
+    echo "    (no readonly manifest at $manifest — rebuild with the updated sandbox-up)"
+    return
+  fi
+  if [ ! -s "$manifest" ]; then
+    echo "    (readonly: list is empty in sandbox-config.yaml — nothing to test)"
+    return
+  fi
+  # try writes against the readonly bind-mount overlays. These should fail
+  # with "Read-only file system" — that's the kernel rejecting the write,
+  # not just file mode bits.
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    local p="/workspace/${rel}"
+    if [ ! -e "$p" ]; then
+      fail "configured readonly path missing in workspace" "$p"
+      continue
+    fi
+    if [ -d "$p" ]; then
+      if touch "$p/.portable-sandbox-test" 2>/tmp/err; then
+        fail "could create file in $p" ""
+        rm -f "$p/.portable-sandbox-test"
+      else
+        local err; err=$(cat /tmp/err)
+        case "$err" in
+          *"Read-only file system"*) pass "writes into ${p}/ rejected by kernel (Read-only file system)" ;;
+          *"Permission denied"*)     pass "writes into ${p}/ rejected (Permission denied — chmod tier)" ;;
+          *)                          pass "writes into ${p}/ rejected: ${err}" ;;
+        esac
+      fi
+    else
+      if echo x >> "$p" 2>/tmp/err; then
+        fail "could append to $p" ""
+      else
+        local err; err=$(cat /tmp/err)
+        case "$err" in
+          *"Read-only file system"*) pass "appends to ${p} rejected by kernel (Read-only file system)" ;;
+          *"Permission denied"*)     pass "appends to ${p} rejected (Permission denied — chmod tier)" ;;
+          *)                          pass "appends to ${p} rejected: ${err}" ;;
+        esac
+      fi
+    fi
+  done < "$manifest"
+}
+
+check_internet_to_anthropic() {
+  head "8. Agent CAN reach the Anthropic API (so claude works)"
+  local code
+  code=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" https://api.anthropic.com/v1/messages 2>/dev/null || echo "timeout")
+  case "$code" in
+    401|400|404|405) pass "api.anthropic.com reachable (HTTP ${code} without auth)" ;;
+    timeout)         fail "could not reach api.anthropic.com" "this means claude will not work; check AGENT_NET DNS" ;;
+    *)               pass "api.anthropic.com reachable (HTTP ${code})" ;;
+  esac
+}
+
+check_no_other_processes() {
+  head "9. Broker process is not visible from the agent"
+  if ps -ef | grep -v grep | grep -q broker-server; then
+    fail "broker process visible inside agent" "$(ps -ef | grep -v grep | grep broker-server)"
+  else
+    pass "no broker process in agent's process table"
+  fi
+}
+
+check_deps_and_manifests() {
+  head "10. Deps installed and manifests still writable"
+  # Manifest writability — agent must be able to `uv add` / `npm install` mid-session.
+  for m in pyproject.toml package.json requirements.txt requirements-test.txt; do
+    local p="/workspace/${m}"
+    [ -e "$p" ] || continue
+    if [ -w "$p" ]; then
+      pass "${m} is writable (agent can add deps)"
+    else
+      fail "${m} is NOT writable — `uv add` / `npm install` will fail" "$(ls -l "$p")"
+    fi
+  done
+  # Dep artifacts present
+  for d in .venv node_modules; do
+    local p="/workspace/${d}"
+    [ -e "$p" ] || continue
+    local count
+    count=$(ls -A "$p" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$count" -gt 0 ]; then
+      pass "${d} populated (${count} entries)"
+    else
+      fail "${d} exists but is empty — install hook didn't run?" ""
+    fi
+  done
+}
+
+check_services_health() {
+  head "11. Services control plane (if configured) is reachable and refuses secret reads"
+  local code
+  code=$(curl -s --max-time 3 -o /dev/null -w "%{http_code}" "${SERVICES_URL}/health" 2>/dev/null || echo "timeout")
+  if [ "$code" = "timeout" ] || [ "$code" = "000" ]; then
+    echo "    (services container not running — skipping; `safe-service list` would also fail)"
+    return
+  fi
+  if [ "$code" = "200" ]; then
+    pass "services /health returns 200"
+  else
+    fail "services /health" "got ${code}"
+  fi
+
+  # Same secret-reading endpoints the broker denies — services container
+  # must also refuse these explicitly.
+  for ep in /raw-env /secrets /env; do
+    code=$(curl -s -o /dev/null -w "%{http_code}" "${SERVICES_URL}${ep}")
+    if [ "$code" = "403" ] || [ "$code" = "404" ]; then
+      pass "GET ${ep} -> ${code}"
+    else
+      fail "services GET ${ep} should be 403/404" "got ${code}"
+    fi
+  done
+
+  # Unknown service names must 404, not crash or accept.
+  local body
+  body=$(curl -s -X POST "${SERVICES_URL}/start/nonexistent-service-name")
+  if echo "$body" | grep -q '"error"'; then
+    pass "unknown service rejected: ${body}"
+  else
+    fail "unknown service should be rejected" "$body"
+  fi
+}
+
+case "${1:-all}" in
+  hidden_env)     check_hidden_env ;;
+  env_vars)       check_env_vars ;;
+  run_secrets)    check_run_secrets ;;
+  raw_endpoints)  check_broker_raw_endpoints ;;
+  broker_health)  check_broker_health ;;
+  readonly_root)  check_readonly_root ;;
+  readonly_paths) check_readonly_paths ;;
+  internet)       check_internet_to_anthropic ;;
+  processes)      check_no_other_processes ;;
+  deps)           check_deps_and_manifests ;;
+  services)       check_services_health ;;
+  all|"")
+    check_hidden_env
+    check_env_vars
+    check_run_secrets
+    check_broker_raw_endpoints
+    check_broker_health
+    check_readonly_root
+    check_readonly_paths
+    check_internet_to_anthropic
+    check_no_other_processes
+    check_deps_and_manifests
+    check_services_health
+    ;;
+  *) echo "unknown check: $1"; exit 2 ;;
+esac
+
+printf "\n\033[1mSummary:\033[0m %d passed, %d failed\n" "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ]
