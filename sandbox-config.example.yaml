@@ -176,6 +176,14 @@ services:
       - "8000"
     secrets: [app_env]
     ports: ["8000:8000"]
+    # The backend runs inside the services container, not on the host, so it
+    # must reach Postgres by its compose service name (postgres:5432), not
+    # localhost. This flips RuntimeSettings.target to 'sandbox' so the backend
+    # derives the DB host accordingly — mirroring docker-compose.yml's
+    # `--profile sandbox` backend service. Without it the backend defaults to
+    # host mode (localhost:5432) and fails with ECONNREFUSED.
+    env:
+      PLUGIN_PLATFORM__RUNTIME__TARGET: sandbox
   mission:
     command: [pnpm, mission:dev, --host, "0.0.0.0"]
     secrets: [app_env]
